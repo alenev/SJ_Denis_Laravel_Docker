@@ -1,0 +1,335 @@
+name: Deploy to Ubuntu via SSH
+
+on:
+  push:
+    branches:
+      - main  
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_PATH: /var/www/каталог деплоя # папка хоста на сервері
+      DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.SJ_SSH_PRIVATE_KEY }} # SSH user private key
+      DEPLOY_SSH_HOST: ${{ secrets.SJ_SSH_HOST }} # SSH host
+      DEPLOY_SSH_USER: ${{ secrets.SJ_SSH_USER }} # SSH user
+      DEPLOY_SSH_PORT: ${{ secrets.SJ_SSH_PORT }} # SSH port
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Remove conflicting containerd packages
+        run: |
+          sudo apt-get remove -y containerd containerd.io || true
+          sudo apt-mark unhold containerd containerd.io || true
+          sudo rm -f /etc/apt/sources.list.d/docker.list
+          
+      - name: Update package lists
+        run: sudo apt-get update
+          
+      - name: Install Docker and docker-compose
+        run: |
+          # Install required packages
+          sudo apt-get install -y \
+              apt-transport-https \
+              ca-certificates \
+              curl \
+              gnupg \
+              lsb-release
+              
+          # Add Docker's official GPG key
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          
+          # Set up the repository
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+            $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            
+          # Install Docker Engine and CLI
+          sudo apt-get update
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          
+          # Verify installations
+          sudo docker --version
+          sudo docker compose version
+
+      # Опційно для фронтенда 
+      # - name: Setup Node.js
+      #   uses: actions/setup-node@v4
+      #   with:
+      #     node-version: 18
+      # - name: Build assets
+      #   run: |
+      #     npm ci
+      #     npm run build
+
+      - name: Deploy files via rsync over SSH
+        uses: easingthemes/ssh-deploy@v5.0.3
+        env:
+          SSH_PRIVATE_KEY: ${{ env.DEPLOY_SSH_PRIVATE_KEY }}
+          REMOTE_HOST: ${{ env.DEPLOY_SSH_HOST }}
+          REMOTE_USER: ${{ env.DEPLOY_SSH_USER }}
+          REMOTE_PORT: ${{ env.DEPLOY_SSH_PORT }} 
+          ARGS: "-rlDzvc --delete --exclude-from=.deployignore --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r"
+          SOURCE: "./"
+          TARGET: "${{ env.DEPLOY_PATH }}" 
+
+      - name: Remote docker compose up
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.DEPLOY_SSH_HOST }}
+          username: ${{ env.DEPLOY_SSH_USER }}
+          key: ${{ env.DEPLOY_SSH_PRIVATE_KEY }}
+          port: ${{ env.DEPLOY_SSH_PORT }}
+          script_stop: true
+          debug: true
+          timeout: 60m
+          command_timeout: 60m
+          script: |
+            set -e
+            # Розширюємо PATH на випадок non-login shell
+            export PATH="/usr/bin:/usr/local/bin:$PATH"
+            cd ${{ env.DEPLOY_PATH }}
+            # Завантажуємо змінні з .env.docker (якщо файл існує)
+            set -a; [ -f .env.docker ] && . ./.env.docker || true; set +a
+            # Параметри проєкту: беремо з .env.docker або з DEPLOY_PROJECT_PREFIX (фолбек)
+            export PROJECT_PREFIX="${PROJECT_PREFIX:-sj}"
+            export WEB_PORT="${WEB_PORT:-8021}"
+
+            # Знаходимо docker бінарник
+            if [ -x /usr/bin/docker ]; then
+              DOCKER_BIN=/usr/bin/docker
+            elif [ -x /usr/local/bin/docker ]; then
+              DOCKER_BIN=/usr/local/bin/docker
+            elif command -v docker >/dev/null 2>&1; then
+              DOCKER_BIN=$(command -v docker)
+            else
+              echo "[ERROR] Docker binary not found in PATH" >&2
+              exit 1
+            fi
+
+            # Визначаємо команду compose (plugin або legacy)
+            if "$DOCKER_BIN" compose version >/dev/null 2>&1; then
+              DC="$DOCKER_BIN compose"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              DC="docker-compose"
+            else
+              echo "[WARN] Neither 'docker compose' nor 'docker-compose' is available. Attempting install..."
+              if command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update -y || true
+                sudo apt-get install -y docker-compose-plugin || true
+              fi
+              if "$DOCKER_BIN" compose version >/dev/null 2>&1; then
+                DC="$DOCKER_BIN compose"
+              else
+                sudo curl -fsSL "https://github.com/docker/compose/releases/download/v2.24.6/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || true
+                sudo chmod +x /usr/local/bin/docker-compose || true
+                if command -v docker-compose >/dev/null 2>&1; then
+                  DC="docker-compose"
+                else
+                  echo "[ERROR] Neither 'docker compose' nor 'docker-compose' could be installed" >&2
+                  exit 1
+                fi
+              fi
+            fi
+
+            # Використовуємо env-file для docker compose, якщо наявний
+            DCC="$DC"; [ -f .env.docker ] && DCC="$DC --env-file .env.docker"
+
+            # Stop and remove existing containers if they exist
+            $DCC down || true
+            
+            # Build and start services
+            $DCC build --pull --no-cache app
+            $DCC up -d
+            
+            # Clean up
+            "$DOCKER_BIN" system prune -f --volumes || true
+            
+            # Verify containers are running
+            echo "Running containers:"
+            $DOCKER_BIN ps
+
+            # Wait for app health to turn healthy
+            echo "[WAIT] Waiting for app health..."
+            ATTEMPTS=60; SLEEP=5; i=1; STATUS="unknown";
+            APP_CTN="${PROJECT_PREFIX:-sj}_app"
+            while [ $i -le $ATTEMPTS ]; do
+              STATUS=$($DOCKER_BIN inspect -f '{{.State.Health.Status}}' "$APP_CTN" 2>/dev/null || echo "missing");
+              echo "[HEALTH] $APP_CTN: $STATUS (attempt $i)";
+              [ "$STATUS" = "healthy" ] && break;
+              sleep $SLEEP; i=$((i+1));
+            done
+            [ "$STATUS" = "healthy" ] || { echo "[FAIL] $APP_CTN did not become healthy" >&2; $DOCKER_BIN logs "$APP_CTN" || true; exit 1; }
+
+      - name: Run Laravel commands inside container
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.DEPLOY_SSH_HOST }}
+          username: ${{ env.DEPLOY_SSH_USER }}
+          key: ${{ env.DEPLOY_SSH_PRIVATE_KEY }}
+          port: ${{ env.DEPLOY_SSH_PORT }}
+          script_stop: true
+          debug: true
+          timeout: 30m
+          command_timeout: 30m
+          script: |
+            set -euxo pipefail
+            export PATH="/usr/bin:/usr/local/bin:$PATH"
+            cd ${{ env.DEPLOY_PATH }}
+            # Завантажуємо змінні з .env.docker (якщо файл існує)
+            set -a; [ -f .env.docker ] && . ./.env.docker || true; set +a
+            # Параметри проєкту: беремо з .env.docker (фолбек на sj)
+            export PROJECT_PREFIX="${PROJECT_PREFIX:-sj}"
+            export WEB_PORT="${WEB_PORT:-8021}"
+
+            echo "[DBG] whoami: $(whoami)"
+            echo "[DBG] pwd: $(pwd)"
+            echo "[DBG] ls -la (top):"
+            ls -la | sed -n '1,120p'
+            if [ -f .env ]; then
+              echo "[DBG] .env exists"
+              stat .env || true
+              head -n 5 .env || true
+            else
+              echo "[WARN] .env not found in ${{ env.DEPLOY_PATH }} (continuing to avoid hard fail)."
+              echo "[HINT] Ensure .env resides on server and is excluded from rsync (.deployignore)."
+            fi
+
+            # Визначаємо команду compose
+            if [ -x /usr/bin/docker ]; then
+              DOCKER_BIN=/usr/bin/docker
+            elif [ -x /usr/local/bin/docker ]; then
+              DOCKER_BIN=/usr/local/bin/docker
+            elif command -v docker >/dev/null 2>&1; then
+              DOCKER_BIN=$(command -v docker)
+            else
+              echo "[ERROR] Docker binary not found in PATH" >&2
+              exit 1
+            fi
+            if "$DOCKER_BIN" compose version >/dev/null 2>&1; then
+              DC="$DOCKER_BIN compose"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              DC="docker-compose"
+            else
+              echo "[WARN] Neither 'docker compose' nor 'docker-compose' is available. Attempting install..."
+              if command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update -y || true
+                sudo apt-get install -y docker-compose-plugin || true
+              fi
+              if "$DOCKER_BIN" compose version >/dev/null 2>&1; then
+                DC="$DOCKER_BIN compose"
+              else
+                sudo curl -fsSL "https://github.com/docker/compose/releases/download/v2.24.6/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || true
+                sudo chmod +x /usr/local/bin/docker-compose || true
+                if command -v docker-compose >/dev/null 2>&1; then
+                  DC="docker-compose"
+                else
+                  echo "[ERROR] Neither 'docker compose' nor 'docker-compose' could be installed" >&2
+                  exit 1
+                fi
+              fi
+            fi
+
+            # Встановлення PHP-залежностей (всередині контейнера app)
+            $DC exec -T app composer install --no-interaction --prefer-dist --no-dev -o
+            $DC exec -T app php artisan key:generate --no-interaction || true
+            $DC exec -T app php artisan storage:link --force || true
+            $DC exec -T app php artisan migrate --force
+            $DC exec -T app php artisan optimize:clear
+            $DC exec -T app php artisan config:cache
+            # Перезапустити воркер(и) після деплою, щоб підхопити оновлений код
+            $DC exec -T app php artisan queue:restart
+            $DC exec -T app php artisan up || true
+            $DC exec -T app php artisan route:cache
+            $DC exec -T app php artisan view:cache
+
+            # Побудова фронтенду на сервері (якщо потрібно)
+            if [ -f package.json ]; then
+              if command -v npm >/dev/null 2>&1; then
+                npm ci --no-audit --no-fund || true
+                npm run build || true
+              fi
+            fi
+
+            # Завершення деплою
+            $DC exec -T app php artisan up || true
+
+      - name: Post-deploy smoke tests (nginx/php-fpm/routes)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.DEPLOY_SSH_HOST }}
+          username: ${{ env.DEPLOY_SSH_USER }}
+          key: ${{ env.DEPLOY_SSH_PRIVATE_KEY }}
+          port: ${{ env.DEPLOY_SSH_PORT }}
+          script_stop: true
+          debug: true
+          timeout: 20m
+          command_timeout: 20m
+          script: |
+            set -euxo pipefail
+            export PATH="/usr/bin:/usr/local/bin:$PATH"
+            cd ${{ env.DEPLOY_PATH }}
+            # Завантажуємо змінні з .env.docker (якщо файл існує)
+            set -a; [ -f .env.docker ] && . ./.env.docker || true; set +a
+            export WEB_PORT="${WEB_PORT:-8021}"
+
+            # Resolve docker and compose
+            if [ -x /usr/bin/docker ]; then DOCKER_BIN=/usr/bin/docker; elif [ -x /usr/local/bin/docker ]; then DOCKER_BIN=/usr/local/bin/docker; elif command -v docker >/dev/null 2>&1; then DOCKER_BIN=$(command -v docker); else echo "[ERROR] Docker not found" >&2; exit 1; fi
+            if "$DOCKER_BIN" compose version >/dev/null 2>&1; then DC="$DOCKER_BIN compose"; elif command -v docker-compose >/dev/null 2>&1; then DC="docker-compose"; else echo "[ERROR] No compose available" >&2; exit 1; fi
+
+            echo "[INFO] docker ps"; "$DOCKER_BIN" ps
+            echo "[INFO] compose ps"; $DC ps
+
+            # nginx config test
+            $DC exec -T web sh -lc 'nginx -t || nginx -T'
+
+            # --- Diagnostics inside app before connectivity checks ---
+            echo "[DIAG] php-fpm config and processes in app"
+            $DC exec -T app sh -lc 'php-fpm -tt 2>&1 | sed -n "1,180p" || true'
+            $DC exec -T app sh -lc 'echo "[CFG] /usr/local/etc/php-fpm.d/"; ls -la /usr/local/etc/php-fpm.d || true'
+            $DC exec -T app sh -lc 'echo "[CFG] www.conf (head)"; sed -n "1,120p" /usr/local/etc/php-fpm.d/www.conf || true'
+            $DC exec -T app sh -lc 'echo "[PROC] php-fpm processes"; ps aux | grep -i php-fpm | grep -v grep || true'
+            $DC exec -T app sh -lc 'echo "[LOG] supervisor logs (tail)"; ls -la /var/log/supervisor 2>/dev/null || true; tail -n 120 /var/log/supervisor/*.log 2>/dev/null || true'
+            $DC logs app --tail=120 || true
+
+            # Ensure tools inside web
+            $DC exec -T web sh -lc 'apk add --no-cache curl netcat-openbsd >/dev/null 2>&1 || true'
+
+            # TCP check to php-fpm (app:9000) from web using nc (BusyBox sh lacks /dev/tcp)
+            ATTEMPTS=20; SLEEP=5; OK=0; i=1;
+            while [ $i -le $ATTEMPTS ]; do
+              if $DC exec -T web sh -lc 'nc -z -w 3 app 9000'; then
+                echo "[OK] app:9000 reachable on attempt $i"; OK=1; break;
+              fi
+              echo "[RETRY] app:9000 not reachable (attempt $i)"; sleep $SLEEP; i=$((i+1));
+            done
+            [ $OK -eq 1 ] || { echo "[FAIL] app:9000 unreachable after retries" >&2; exit 1; }
+
+            # Curl from inside web to local nginx (bypasses firewalls/load balancers)
+            ATTEMPTS=20; SLEEP=5; CODE=""; i=1; \
+            while [ $i -le $ATTEMPTS ]; do \
+              CODE=$($DC exec -T web sh -lc 'curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/api-routes' || true); \
+              echo "[WEB] Attempt $i -> HTTP:$CODE"; \
+              [ "$CODE" = "200" ] && break; \
+              sleep $SLEEP; i=$((i+1)); \
+            done; \
+            [ "$CODE" = "200" ] || { echo "[FAIL] /api-routes inside web returned HTTP:$CODE" >&2; exit 1; }
+
+            # Curl from host to published port 8021
+            ATTEMPTS=20; SLEEP=5; CODE=""; i=1; \
+            while [ $i -le $ATTEMPTS ]; do \
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${WEB_PORT}/api-routes || true); \
+              echo "[HOST] Attempt $i -> HTTP:$CODE (port ${WEB_PORT})"; \
+              [ "$CODE" = "200" ] && break; \
+              sleep $SLEEP; i=$((i+1)); \
+            done; \
+            [ "$CODE" = "200" ] || { echo "[FAIL] /api-routes on host:${WEB_PORT} returned HTTP:$CODE" >&2; exit 1; }
+
+            # Verify route exists in Laravel (best-effort)
+            $DC exec -T app php artisan route:list --path=api-routes --columns=Method,URI,Name,Action,Middleware || true
+
